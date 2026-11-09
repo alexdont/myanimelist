@@ -1,7 +1,7 @@
 defmodule MyAnimeList.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @description "MyAnimeList API v2 client for Elixir, covering both anime and manga: public search & metadata, the OAuth (PKCE) login flow, and authenticated list sync. Errors as values, a Req.Test seam, and a TokenStore behaviour so persistence stays in your app (no Ecto dependency)."
   @source_url "https://github.com/alexdont/myanimelist"
 

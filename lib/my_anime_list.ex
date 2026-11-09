@@ -67,13 +67,24 @@ defmodule MyAnimeList do
   def statuses(:anime), do: ~w(watching completed on_hold dropped plan_to_watch)
   def statuses(:manga), do: ~w(reading completed on_hold dropped plan_to_read)
 
+  defp include_fields(media, include) do
+    include
+    |> Enum.flat_map(fn
+      :related -> ["related_#{path_seg(media)}"]
+      :themes when media == :anime -> ["opening_themes", "ending_themes"]
+      :recommendations -> ["recommendations"]
+      _ -> []
+    end)
+    |> Enum.map_join(&("," <> &1))
+  end
+
   defp detail_fields(:manga),
     do: @common_detail <> ",num_volumes,num_chapters,authors{first_name,last_name}"
 
   defp detail_fields(:anime),
     do:
       @common_detail <>
-        ",num_episodes,average_episode_duration,start_season,studios,source,rating"
+        ",num_episodes,average_episode_duration,start_season,broadcast,studios,source,rating"
 
   @doc "Public MAL page URL for a title."
   @spec page_url(media, term()) :: String.t()
@@ -113,17 +124,34 @@ defmodule MyAnimeList do
   @doc """
   Full metadata for a title id, normalized for enrichment. Common fields:
   `id, url, title, cover_url, synopsis, genres, score, rank, popularity,
-  num_users, media_type, status, year, year_start, year_end`. Manga adds
-  `num_chapters, num_volumes, authors`; anime adds `num_episodes, studios`
-  (the other media's fields are present as `nil`/`[]`).
+  num_users, media_type, status, year, year_start, year_end`, the other
+  names (`title_en`, `title_ja`, `synonyms`) and `related` (see below).
+  Manga adds `num_chapters, num_volumes, authors`; anime adds
+  `num_episodes, studios, episode_duration` (seconds), `season`
+  (`%{year: 2023, season: "fall"}`), `broadcast` (`%{day: "friday", time:
+  "23:00"}`, Japan time), `source` (`"manga"`, `"original"`, …) and `rating`
+  (`"pg_13"`, …). The other media's fields are present as `nil`/`[]`.
 
-  Options: `:req_options`.
+  Options:
+
+    * `:include` — extra parts to fetch in the same request:
+      * `:related` — `related: [%{id, title, relation, cover_url}]`, where
+        `relation` is MAL's own (`"sequel"`, `"prequel"`, `"side_story"`, …);
+        anime list related anime, manga related manga.
+      * `:themes` (anime) — `openings` and `endings`, parsed by
+        `parse_theme/1`.
+      * `:recommendations` — `recommendations: [%{id, title, cover_url, votes}]`.
+      Not included, these are `[]`.
+    * `:req_options`.
   """
   @spec get(media, term(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def get(media, id, client_id, opts \\ []) when media in @media do
+    include = Keyword.get(opts, :include, [])
+    fields = detail_fields(media) <> include_fields(media, include)
+
     with true <- configured?(client_id) || {:error, :not_configured},
          {:ok, %{status: 200, body: body}} <-
-           http_get("/#{path_seg(media)}/#{id}", client_id, [fields: detail_fields(media)], opts) do
+           http_get("/#{path_seg(media)}/#{id}", client_id, [fields: fields], opts) do
       {:ok, to_details(media, body)}
     else
       {:error, :not_configured} = err -> err
@@ -315,8 +343,13 @@ defmodule MyAnimeList do
   @doc """
   Update the authenticated user's list entry (`PATCH
   /{media}/{id}/my_list_status`). `fields` is a plain map, e.g.
-  `%{num_episodes_watched: 12, status: "watching"}` for anime or
+  `%{num_watched_episodes: 12, status: "watching"}` for anime or
   `%{num_chapters_read: 12, status: "reading"}` for manga.
+
+  Mind the anime spelling: MAL *responses* say `num_episodes_watched`, but the
+  update form wants `num_watched_episodes`, and an unknown field is a 400
+  ("this form should not contain extra fields"). `progress_fields/4` builds a
+  correct form for you.
   """
   @spec update_list_status(media, String.t(), term(), map(), keyword()) ::
           {:ok, map()} | {:error, term()}
@@ -335,6 +368,325 @@ defmodule MyAnimeList do
     case Req.request(req) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
       other -> translate_error(other)
+    end
+  end
+
+  # ── anime extras ──────────────────────────────────────────────────
+
+  @doc """
+  An anime's opening and ending songs: `{:ok, %{openings: [theme], endings:
+  [theme]}}`, each theme as `parse_theme/1` reads it. Empty lists when MAL
+  lists none.
+  """
+  @spec themes(term(), String.t(), keyword()) ::
+          {:ok, %{openings: [map()], endings: [map()]}} | {:error, term()}
+  def themes(id, client_id, opts \\ []) do
+    with true <- configured?(client_id) || {:error, :not_configured},
+         {:ok, %{status: 200, body: body}} <-
+           http_get("/anime/#{id}", client_id, [fields: "opening_themes,ending_themes"], opts) do
+      {:ok,
+       %{openings: themes_of(body["opening_themes"]), endings: themes_of(body["ending_themes"])}}
+    else
+      {:error, :not_configured} = err -> err
+      other -> translate_error(other)
+    end
+  end
+
+  @doc """
+  Reads one of MAL's theme lines — `#2: "Space Lion" by The Seatbelts (ep 13)`
+  — into `%{n: 2, song: "Space Lion", artist: "The Seatbelts", eps: "ep 13"}`.
+  A line that isn't in that shape is kept whole as the `song`; a blank one is
+  `nil`.
+  """
+  @spec parse_theme(term()) :: map() | nil
+  def parse_theme(text) when is_binary(text) do
+    case Regex.run(
+           ~r/^\s*(?:#?(\d+)\s*:\s*)?"(.+?)"\s+by\s+(.+?)(?:\s+\((eps?\.?[^)]*)\))?\s*$/u,
+           text
+         ) do
+      [_, n, song, artist | rest] ->
+        %{
+          n: if(n == "", do: nil, else: String.to_integer(n)),
+          song: song,
+          artist: artist,
+          eps: rest |> List.first() |> blank()
+        }
+
+      _ ->
+        case String.trim(text) do
+          "" -> nil
+          plain -> %{n: nil, song: plain, artist: nil, eps: nil}
+        end
+    end
+  end
+
+  def parse_theme(_), do: nil
+
+  @doc """
+  Every season of a series in order, found by walking MAL's prequel/sequel
+  links from any one of its entries: `{:ok, [%{id, title, media_type,
+  num_episodes, start_date, cover_url}]}`, oldest first. MAL keeps each
+  season (and each cour) as its own entry; this is how to show them as one
+  series.
+
+  Only `"prequel"`/`"sequel"` links are followed, and only to entries of the
+  kinds in `:media_types` (default `["tv", "ona"]`, so films and specials in
+  between are skipped over rather than listed). Every step is one request, so
+  the walk stops after `:max` entries (default 12).
+
+  Options: `:media_types`, `:max`, `:req_options`.
+  """
+  @spec seasons(term(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def seasons(id, client_id, opts \\ []) do
+    kinds = Keyword.get(opts, :media_types, ["tv", "ona"])
+    max = Keyword.get(opts, :max, 12)
+
+    with true <- configured?(client_id) || {:error, :not_configured},
+         {:ok, first} <- season_node(id, client_id, opts) do
+      seen = %{first.id => true}
+      {back, seen} = walk(first, "prequel", client_id, opts, kinds, seen, max - 1, [])
+      {fwd, _} = walk(first, "sequel", client_id, opts, kinds, seen, max - 1 - length(back), [])
+      {:ok, Enum.map(back ++ [first | Enum.reverse(fwd)], &Map.delete(&1, :links))}
+    end
+  end
+
+  defp walk(_node, _rel, _cid, _opts, _kinds, seen, left, acc) when left <= 0, do: {acc, seen}
+
+  defp walk(node, rel, cid, opts, kinds, seen, left, acc) do
+    case Enum.find(node.links, fn {r, nid} -> r == rel and not Map.has_key?(seen, nid) end) do
+      nil ->
+        {acc, seen}
+
+      {_, nid} ->
+        case season_node(nid, cid, opts) do
+          {:ok, next} ->
+            seen = Map.put(seen, nid, true)
+
+            if next.media_type in kinds,
+              do: walk(next, rel, cid, opts, kinds, seen, left - 1, [next | acc]),
+              else: walk(next, rel, cid, opts, kinds, seen, left - 1, acc)
+
+          _ ->
+            {acc, seen}
+        end
+    end
+  end
+
+  defp season_node(id, client_id, opts) do
+    fields = "id,title,main_picture,media_type,num_episodes,start_date,related_anime"
+
+    case http_get("/anime/#{id}", client_id, [fields: fields], opts) do
+      {:ok, %{status: 200, body: n}} ->
+        {:ok,
+         %{
+           id: n["id"],
+           title: n["title"],
+           media_type: n["media_type"],
+           num_episodes: positive(n["num_episodes"]),
+           start_date: n["start_date"],
+           cover_url: cover(n["main_picture"]),
+           links:
+             for(
+               %{"node" => %{"id" => rid}, "relation_type" => r} <- n["related_anime"] || [],
+               do: {r, rid}
+             )
+         }}
+
+      other ->
+        translate_error(other)
+    end
+  end
+
+  @doc """
+  The anime of a broadcast season (`"winter"`, `"spring"`, `"summer"`,
+  `"fall"`), in the search-result shape plus `num_users`. MAL lists
+  everything that aired in the season, including continuing long-runners.
+
+  Options: `:sort` (`"anime_num_list_users"` default, or `"anime_score"`),
+  `:limit` (default 100, MAL's max 500), `:req_options`.
+  """
+  @spec seasonal(integer(), String.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def seasonal(year, season, client_id, opts \\ [])
+      when is_integer(year) and season in ~w(winter spring summer fall) do
+    params = [
+      sort: Keyword.get(opts, :sort, "anime_num_list_users"),
+      limit: Keyword.get(opts, :limit, 100),
+      fields: @search_fields <> ",num_list_users,num_episodes",
+      nsfw: true
+    ]
+
+    node_list("/anime/season/#{year}/#{season}", client_id, params, opts)
+  end
+
+  @doc """
+  The broadcast season a date falls in, the way MAL counts them (January–March
+  winter, April–June spring, July–September summer, October–December fall):
+  `{2026, "fall"}`.
+  """
+  @spec season_of(Date.t()) :: {integer(), String.t()}
+  def season_of(%Date{year: y, month: m}) do
+    {y, Enum.at(~w(winter spring summer fall), div(m - 1, 3))}
+  end
+
+  @doc """
+  A MAL ranking, in the search-result shape plus `rank` and `num_users`.
+  Anime types: `"all"`, `"airing"`, `"upcoming"`, `"tv"`, `"ova"`, `"movie"`,
+  `"special"`, `"bypopularity"`, `"favorite"`; manga: `"all"`, `"manga"`,
+  `"novels"`, `"oneshots"`, `"doujin"`, `"manhwa"`, `"manhua"`,
+  `"bypopularity"`, `"favorite"`.
+
+  Options: `:limit` (default 100, max 500), `:offset`, `:req_options`.
+  """
+  @spec ranking(media, String.t(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def ranking(media, type, client_id, opts \\ []) when media in @media and is_binary(type) do
+    params = [
+      ranking_type: type,
+      limit: Keyword.get(opts, :limit, 100),
+      offset: Keyword.get(opts, :offset, 0),
+      fields: @search_fields <> ",num_list_users,rank",
+      nsfw: true
+    ]
+
+    node_list("/#{path_seg(media)}/ranking", client_id, params, opts)
+  end
+
+  defp node_list(path, client_id, params, opts) do
+    with true <- configured?(client_id) || {:error, :not_configured},
+         {:ok, %{status: 200, body: %{"data" => data}}} <- http_get(path, client_id, params, opts) do
+      {:ok,
+       for %{"node" => n} = row <- data do
+         n
+         |> to_search_result()
+         |> Map.merge(%{
+           num_users: n["num_list_users"],
+           rank: get_in(row, ["ranking", "rank"]) || n["rank"]
+         })
+       end}
+    else
+      {:error, :not_configured} = err -> err
+      other -> translate_error(other)
+    end
+  end
+
+  # ── list updates ──────────────────────────────────────────────────
+
+  @doc """
+  The update form for "the user is now at `count`" — the right field name for
+  `media`, and the status that follows from it: `"completed"` with today's
+  `finish_date` when `count` reaches a known `total`, else `"watching"` /
+  `"reading"`. An entry whose total MAL doesn't know (an airing show, an
+  ongoing manga) stays in progress, since nothing here can tell when it ends.
+
+      MyAnimeList.progress_fields(:anime, 12, 12)
+      #=> %{num_watched_episodes: 12, status: "completed", finish_date: "2026-11-09"}
+
+  Options: `:today` (a `Date`, for tests and time zones).
+  """
+  @spec progress_fields(media, non_neg_integer(), non_neg_integer() | nil, keyword()) :: map()
+  def progress_fields(media, count, total, opts \\ [])
+      when media in @media and is_integer(count) and count >= 0 do
+    key = if media == :anime, do: :num_watched_episodes, else: :num_chapters_read
+    going = if media == :anime, do: "watching", else: "reading"
+
+    if is_integer(total) and total > 0 and count >= total do
+      today = Keyword.get_lazy(opts, :today, &Date.utc_today/0)
+      %{key => count, status: "completed", finish_date: Date.to_iso8601(today)}
+    else
+      %{key => count, status: going}
+    end
+  end
+
+  @doc "Set the user's score (0–10; 0 clears it) for a title."
+  @spec rate(media, String.t(), term(), 0..10, keyword()) :: {:ok, map()} | {:error, term()}
+  def rate(media, access_token, id, score, opts \\ []) when score in 0..10,
+    do: update_list_status(media, access_token, id, %{score: score}, opts)
+
+  @doc "Take a title off the user's list. Not being on it is not an error."
+  @spec delete_list_status(media, String.t(), term(), keyword()) :: :ok | {:error, term()}
+  def delete_list_status(media, access_token, id, opts \\ []) when media in @media do
+    req =
+      Req.new(
+        method: :delete,
+        url: "#{@base_url}/#{path_seg(media)}/#{id}/my_list_status",
+        headers: [{"authorization", "Bearer #{access_token}"}],
+        receive_timeout: 15_000,
+        retry: false
+      )
+      |> Req.merge(req_options(opts))
+
+    case Req.request(req) do
+      {:ok, %{status: s}} when s in [200, 404] -> :ok
+      other -> translate_error(other)
+    end
+  end
+
+  @doc """
+  The authenticated user's whole list with something about each title, not
+  just the status: `{:ok, [%{id, title, cover_url, media_type, total,
+  episode_duration, list_status}]}`, where `total` is the episode or chapter
+  count MAL knows (`nil` while unknown) and `episode_duration` is in seconds
+  (anime only). Paginates like `list_statuses/3`.
+  """
+  @spec list_entries(media, String.t(), keyword()) :: {:ok, [map()]}
+  def list_entries(media, access_token, opts \\ []) when media in @media do
+    extra =
+      if media == :anime,
+        do: "num_episodes,average_episode_duration",
+        else: "num_chapters,num_volumes"
+
+    url =
+      "#{@base_url}/users/@me/#{list_seg(media)}?" <>
+        URI.encode_query(%{
+          "fields" => "list_status,main_picture,media_type," <> extra,
+          "limit" => 1000,
+          "nsfw" => "true"
+        })
+
+    rows =
+      access_token
+      |> paginate_rows(url, [], 0, opts)
+      |> Enum.reverse()
+      |> Enum.map(fn %{"node" => n} = row ->
+        %{
+          id: n["id"],
+          title: n["title"],
+          cover_url: cover(n["main_picture"]),
+          media_type: n["media_type"],
+          total: positive(n["num_episodes"] || n["num_chapters"]),
+          episode_duration: positive(n["average_episode_duration"]),
+          list_status: row["list_status"] || %{}
+        }
+      end)
+
+    {:ok, rows}
+  end
+
+  defp paginate_rows(_token, nil, acc, _page, _opts), do: acc
+  defp paginate_rows(_token, _url, acc, page, _opts) when page >= 20, do: acc
+
+  defp paginate_rows(access_token, url, acc, page, opts) do
+    req =
+      Req.new(
+        url: url,
+        headers: [{"authorization", "Bearer #{access_token}"}],
+        receive_timeout: 15_000,
+        retry: false
+      )
+      |> Req.merge(req_options(opts))
+
+    case Req.get(req) do
+      {:ok, %{status: 200, body: %{"data" => data} = body}} ->
+        acc =
+          Enum.reduce(data, acc, fn
+            %{"node" => %{"id" => id}} = r, a when is_integer(id) -> [r | a]
+            _, a -> a
+          end)
+
+        paginate_rows(access_token, get_in(body, ["paging", "next"]), acc, page + 1, opts)
+
+      _ ->
+        acc
     end
   end
 
@@ -428,7 +780,12 @@ defmodule MyAnimeList do
       start_date: n["start_date"],
       end_date: n["end_date"],
       year_start: year_of(n["start_date"]),
-      year_end: year_of(n["end_date"])
+      year_end: year_of(n["end_date"]),
+      title_en: blank(get_in(n, ["alternative_titles", "en"])),
+      title_ja: blank(get_in(n, ["alternative_titles", "ja"])),
+      synonyms: get_in(n, ["alternative_titles", "synonyms"]) || [],
+      related: related(n["related_#{path_seg(media)}"]),
+      recommendations: recommendations(n["recommendations"])
     }
 
     Map.merge(base, media_details(media, n))
@@ -440,7 +797,14 @@ defmodule MyAnimeList do
       num_volumes: n["num_volumes"],
       authors: people(n["authors"]),
       num_episodes: nil,
-      studios: []
+      studios: [],
+      episode_duration: nil,
+      season: nil,
+      broadcast: nil,
+      source: nil,
+      rating: nil,
+      openings: [],
+      endings: []
     }
   end
 
@@ -448,6 +812,13 @@ defmodule MyAnimeList do
     %{
       num_episodes: n["num_episodes"],
       studios: names(n["studios"]),
+      episode_duration: positive(n["average_episode_duration"]),
+      season: season(n["start_season"]),
+      broadcast: broadcast(n["broadcast"]),
+      source: blank(n["source"]),
+      rating: blank(n["rating"]),
+      openings: themes_of(n["opening_themes"]),
+      endings: themes_of(n["ending_themes"]),
       num_chapters: nil,
       num_volumes: nil,
       authors: []
@@ -482,6 +853,53 @@ defmodule MyAnimeList do
     do: list |> Enum.map(& &1["name"]) |> Enum.reject(&(&1 in [nil, ""]))
 
   defp names(_), do: []
+
+  defp blank(v) when v in [nil, ""], do: nil
+  defp blank(v), do: v
+
+  defp positive(n) when is_integer(n) and n > 0, do: n
+  defp positive(_), do: nil
+
+  defp season(%{"year" => y, "season" => s}) when is_integer(y) and is_binary(s),
+    do: %{year: y, season: s}
+
+  defp season(_), do: nil
+
+  defp broadcast(%{"day_of_the_week" => d} = b) when is_binary(d),
+    do: %{day: d, time: blank(b["start_time"])}
+
+  defp broadcast(_), do: nil
+
+  defp themes_of(list) when is_list(list),
+    do: for(t <- list, th = parse_theme(t["text"]), th != nil, do: th)
+
+  defp themes_of(_), do: []
+
+  defp related(list) when is_list(list) do
+    for %{"node" => n} = r <- list, is_integer(n["id"]) do
+      %{
+        id: n["id"],
+        title: n["title"],
+        relation: r["relation_type"],
+        cover_url: cover(n["main_picture"])
+      }
+    end
+  end
+
+  defp related(_), do: []
+
+  defp recommendations(list) when is_list(list) do
+    for %{"node" => n} = r <- list, is_integer(n["id"]) do
+      %{
+        id: n["id"],
+        title: n["title"],
+        cover_url: cover(n["main_picture"]),
+        votes: r["num_recommendations"]
+      }
+    end
+  end
+
+  defp recommendations(_), do: []
 
   defp translate_error({:ok, %{status: 404}}), do: {:error, :not_found}
   defp translate_error({:ok, %{status: 401}}), do: {:error, :unauthorized}

@@ -6,7 +6,7 @@ first argument on every call.
 
 ```elixir
 def deps do
-  [{:myanimelist, "~> 0.1"}]
+  [{:myanimelist, "~> 0.2"}]
 end
 ```
 
@@ -70,6 +70,35 @@ the valid status vocabulary when building an update:
 ```elixir
 MyAnimeList.progress_key(:anime)  #=> "num_episodes_watched"
 MyAnimeList.statuses(:manga)      #=> ["reading", "completed", "on_hold", "dropped", "plan_to_read"]
+```
+
+## Anime extras
+
+```elixir
+{:ok, a} = MyAnimeList.get(:anime, 52991, client_id, include: [:related, :themes])
+a.season            #=> %{year: 2023, season: "fall"}
+a.episode_duration  #=> 1475   (seconds)
+a.openings          #=> [%{n: nil, song: "Yuusha", artist: "YOASOBI", eps: "eps 1-16"}]
+a.related           #=> [%{id: 59978, title: "…", relation: "sequel", cover_url: "…"}, …]
+
+# MAL keeps each season as its own entry; walk them into one series:
+{:ok, seasons} = MyAnimeList.seasons(40028, client_id)
+Enum.map(seasons, & &1.title)
+#=> ["Shingeki no Kyojin", "… Season 2", "… Season 3", "… Season 3 Part 2", "… The Final Season", …]
+
+{year, season} = MyAnimeList.season_of(Date.utc_today())   #=> {2026, "fall"}
+{:ok, airing} = MyAnimeList.seasonal(year, season, client_id, limit: 50)
+{:ok, top} = MyAnimeList.ranking(:anime, "airing", client_id, limit: 10)
+```
+
+Updating progress: MAL's update form wants `num_watched_episodes` for anime
+(its responses say `num_episodes_watched`, and sending that back is a 400).
+`progress_fields/4` gets it right and completes the entry at a known total:
+
+```elixir
+fields = MyAnimeList.progress_fields(:anime, 12, 12)
+#=> %{num_watched_episodes: 12, status: "completed", finish_date: "2026-11-09"}
+MyAnimeList.update_list_status(:anime, token.access_token, 52991, fields)
 ```
 
 ## Persisting tokens

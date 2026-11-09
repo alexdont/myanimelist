@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0
+
+Anime gets its own parts.
+
+- `get/4` now returns the anime fields it already asked MAL for and used to
+  drop: `episode_duration` (seconds), `season` (`%{year, season}`),
+  `broadcast`, `source`, `rating`; and, for both media, the other names
+  (`title_en`, `title_ja`, `synonyms`).
+- `get/4` takes `include: [:related, :themes, :recommendations]` to fetch
+  related entries (with MAL's relation type), opening/ending songs and
+  recommendations in the same request.
+- `seasons/3` — every season of a series in order, walking MAL's
+  prequel/sequel links from any one entry (films and specials in between
+  skipped).
+- `themes/3` and `parse_theme/1` — opening/ending songs as
+  `%{n, song, artist, eps}`.
+- `seasonal/4`, `season_of/1`, `ranking/4` — the broadcast season's anime
+  and MAL's rankings (anime and manga).
+- `progress_fields/4` — the update form for "now at N": the field name MAL's
+  form actually accepts (`num_watched_episodes` for anime, not the response's
+  `num_episodes_watched`, which MAL rejects with a 400), completed with a
+  `finish_date` at a known total.
+- `rate/5`, `delete_list_status/4`, `list_entries/3` (the list with each
+  title's name, cover, totals and episode length).
+- Docs: `update_list_status/5`'s anime example used the response spelling,
+  which MAL refuses; fixed.
+
 ## 0.1.0
 
 Initial release.
